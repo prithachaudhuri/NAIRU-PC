@@ -1,0 +1,456 @@
+---
+title: "Is the Phillips Curve dead for all? Estimating PC and NAIRU for subgroups of the labor market."
+author: "Pritha Chaudhuri"
+date: "5/19/2020"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+<style> p.caption {font-weight: bold;} </style>
+
+<div style="margin-bottom:100px;">
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = FALSE)
+```
+
+```{r}
+library(pacman) # package to install and load packages with one command
+p_load(tidyverse,lubridate,xml2,rvest,ggplot2,doParallel,stargazer)
+set.seed(123)
+
+## Header for tabset
+catHeader <- function(text = "", level = 3) {
+  cat(paste0("\n\n",paste(rep("#", level),collapse="")," ",text,"\n"))
+}
+```
+
+## Estimate Aggregate Phillips Curve
+Estimate following Phillips Curve similar to CG (2015) and Tillman (2010). 
+$$ \pi_t-\mathbb{E}\pi_{t+1}=\beta_0+\beta_1u_t+\varepsilon_t $$
+where inflation expectations is backwards looking assuming adaptive expectations, as in CG (2015)
+$$\mathbb{E}\pi_{t+1}=\frac{1}{4}\big(\pi_{t-1}+\pi_{t-2}+\pi_{t-3}+\pi_{t-4} \big) $$
+Available measures of inflation and inflation expectations
+
+ * Consumer Price Index (CPI), BLS measure
+ * Personal Consumption Expenditure, BEA measure
+ * GDP Deflator
+ * Greenbook forecasts
+ * FOMC Member forecasts
+ * Michigan Survey of Consumers, household expectations of inflation
+
+Measure of unemployment
+
+ * BLS measure
+ * Greenbook forecast
+ * FOMC member forecasts
+
+### CPI, PCE and BLS measure of unemployment: 1990-2019 {.tabset}
+```{r}
+get_data <- function(macrovars, start, end){
+  tsmacro <- list()
+  for (i in macrovars){
+    tsmacro[[i]] <- read.csv(paste0("data/",i,".csv"), header = T, stringsAsFactors = F) %>%
+      mutate(Date = as.Date.character(DATE, tryFormats = "%Y-%m-%d"),
+             year = year(Date),
+             month = month(Date)) %>%
+      filter(year %in% c(start:end)) %>% 
+      select(Date, year, month, i)
+  }
+  
+  # aggmacro <- bind_cols(tsmacro) %>% 
+  #   select(Date, year, month, macrovars)
+  
+  aggmacro <- bind_cols(tsmacro) %>%
+    arrange(Date) %>%
+    mutate(piCPI = log(CPIAUCSL)-lag(log(CPIAUCSL)),
+           EpiCPI =(lag(piCPI,1)+lag(piCPI,2)+lag(piCPI,3)+lag(piCPI,4))/4,
+           piCPIdiff = piCPI - EpiCPI,
+           piPCEPI = log(PCEPI)-lag(log(PCEPI)),
+           EpiPCEPI = (lag(piPCEPI,1)+lag(piPCEPI,2)+lag(piPCEPI,3)+lag(piPCEPI,4))/4,
+           piPCEPIdiff = piPCEPI - EpiPCEPI) %>%
+    filter(year %in% c(start+1:end)) %>%
+    select(Date, year, month, macrovars, piCPI, EpiCPI, piCPIdiff, piPCEPI, EpiPCEPI, piPCEPIdiff)
+  
+  return(aggmacro)
+}
+
+run_reg <- function(y,x,data){
+  form <- as.formula(paste0(y,"~",x))
+  lm(form, data)
+}
+
+macrovars <- c("UNRATE", "CPIAUCSL", "PCEPI")
+aggdata <- get_data(macrovars, 1989, 2019)
+```
+
+
+#### PC plot 1989-2019
+```{r}
+aggdata %>% 
+  ggplot(aes(UNRATE, piCPIdiff)) +
+  geom_point(shape = 15, color = "blue") +
+  geom_smooth(method = lm, se = FALSE, linetype = "dashed", color = "black") +
+  theme_minimal()
+```
+
+#### Regression result
+```{r}
+aggpc <- lapply(c("piCPIdiff", "piPCEPIdiff"), function(y) run_reg(y, "UNRATE", aggdata))
+stargazer(aggpc, type = "text")
+```
+Slope and intercept insignificant for 1992-98 sample and 1990-2019 sample. Implied NAIRU is
+Both slope and intercept terms insignificant for CPI and PCE measures of inflation.
+
+#### NAIRU estimate
+```{r}
+nairu_agg <- vector(mode = "numeric", length = length(aggpc))
+for(i in 1:length(aggpc)){
+  nairu_agg <- -aggpc[[i]]$coefficients[1]/aggpc[[i]]$coefficients[2]
+}
+nairu_agg
+```
+
+### Greenbook forecasts: 1992-98 and 1990-2013 {.tabset}
+Greenbook projections are made available to the FOMC before each meeting. The Fed research staff makes projections of how the economy will fare in the future. The data is made available to the public with a 5 year lag. Most current year of data is 2013.
+Estimate the following equation
+$$ \pi_t-\mathbb{E}\pi_{t+1}=\beta_0+\beta_1u_t+\varepsilon_t $$
+where 
+
+ * $\pi_t=gPCPIXF0$: core CPI inflation projection for current quarter (t).
+ * $\mathbb{E}\pi_{t+1}=gPCPIXB1$: core CPI inflation historical value for previous quarter (t-1), assuming adaptive expectations. 
+ * $u_t=UNEMPF0$: unemployment rate projection for current quarter (t).
+```{r}
+get_gbdata <- function(timelims){
+  start <- substr(timelims,1,4)
+  end <- substr(timelims,6,9)
+  gbdata <- read.csv("data/GBdata.csv", header = T, stringsAsFactors = F) %>% 
+  mutate(date = lubridate::ymd(GBdate),
+         year = year(date), 
+         month = month(date),
+         dPCPIX = gPCPIXF0 - gPCPIXB1) %>% 
+  filter(year %in% c(start:end)) 
+}
+```
+
+#### {.tabset}
+```{r, results="asis"}
+gbdatalims <- c("1990-1997", "1998-2005", "2006-2013")
+plot_gbdata <- lapply(gbdatalims, function(x) get_gbdata(x) %>%
+                      ggplot(aes(UNEMPF0, dPCPIX)) +
+  geom_point(shape = 15, color = "blue") +
+  geom_smooth(method = lm, se = FALSE, linetype = "dashed", color = "black") +
+  theme_minimal() )
+
+for (i in 1:length(plot_gbdata)) {
+  catHeader(gbdatalims[[i]], level = 5)
+  print(plot_gbdata[[i]])
+}
+
+```
+ 
+##### Regression results
+```{r}
+gbdatapc <- lapply(gbdatalims, function(x) run_reg("dPCPIX", "UNEMPF0", get_gbdata(x)))
+stargazer(gbdatapc, type = "text")
+```
+
+1. `r gbdatalims[1]` sample 
+2. `r gbdatalims[2]` sample.
+3. `r gbdatalims[3]` sample. 
+
+Slope and intercept insignificant for all samples. 
+
+##### NAIRU estimate
+```{r}
+nairu_gb <- vector(mode = "numeric", length = length(gbdatapc))
+for(i in 1:length(gbdatapc)){
+  nairu_gb[i] <- -gbdatapc[[i]]$coefficients[1]/gbdatapc[[i]]$coefficients[2]
+}
+
+nairu_gb
+```
+
+### FOMC member forecasts: Similar to Tillmann (2010) 
+FOMC member forecasts are released with the Monetary Policy Report, made twice a year in February and July. These forecasts are made by the 12 regional Federal Reserve Bank presidents and the members of the Board fo Governors excluding the Chairman. These forecasts are released by the Philadelphia Fed with a 10 year lag, so only forecasts up till 2007 is available. For the estimation exercise I use forecasts made at the July meetings for each year. 
+Estimate the following equation 
+$$ \pi_{t+5|t}-\pi_{t+1|t}=\beta_0+\beta_1u_{t+1|t}+\varepsilon_t $$
+where
+
+ * $t$ is July meeting (Q3) of that year.
+ * $\pi_{t+5|t}$ is inflation forecast made in July meeting for Q4 of following year. 
+ * $\pi_{t+1|t}$ is inflation forecast made in July meeting for Q4 for current year. 
+ * $u_{t+1|t}$ is unemployment forecast made in Juy meeting for Q4 of current year. 
+
+Note that the above specification of the Phillips curve assumes adaptive expectations, where expected inflation is backward looking. In an alternative specification Tillmann (2010) uses $u_{t+5|t}$ instead of $u_{t+1|t}$.
+
+```{r}
+get_fomcdata <- function(timelims){
+  start <- substr(timelims,1,4)
+  end <- substr(timelims,6,9)
+  gbdata <- read.csv("data/fomcforecasts.csv", header = T, stringsAsFactors = F) %>% 
+  mutate(date = lubridate::ymd(MPRdate),
+         year = year(date), 
+         month = month(date),
+         dINFL = INFLNY - INFLCY) %>% 
+  filter(year %in% c(start:end)) 
+}
+```
+
+#### {.tabset}
+```{r, results="asis", echo=F}
+fomcdatalims <- c("1992-1998", "1999-2007", "1992-2007")
+plot_fomc <- lapply(fomcdatalims, function(x) get_fomcdata(x) %>%
+                      ggplot(aes(UNEMPCY, dINFL)) +
+  geom_point(shape = 15, color = "blue") +
+  geom_smooth(method = lm, se = FALSE, linetype = "dashed", color = "black") +
+  theme_minimal() )
+
+for (i in 1:length(plot_fomc)) {
+  catHeader(fomcdatalims[[i]], level = 5)
+  print(plot_fomc[[i]])
+}
+
+```
+
+##### Regression results
+```{r}
+fomcdatapc <- lapply(fomcdatalims, function(x) run_reg("dINFL", "UNEMPCY", get_fomcdata(x)))
+stargazer(fomcdatapc, type = "text")
+```
+
+1. `r fomcdatalims[1]` sample. 
+2. `r fomcdatalims[2]` sample. 
+3. `r fomcdatalims[3]` sample. 
+
+Significance of slope and intercept goes away as sample increases.   
+
+##### NAIRU estimate
+```{r}
+nairu_fomc <- vector(mode = "numeric", length = length(fomcdatapc))
+for(i in 1:length(fomcdatapc)){
+  nairu_fomc[i] <- -fomcdatapc[[i]]$coefficients[1]/fomcdatapc[[i]]$coefficients[2]
+}
+nairu_fomc
+```
+
+## Estimate Disaggregate Phillips Curve
+Above exercise so far has been considering the entire economy and the aggregate unemployment rate. But what about different subgroups of the labor market? Will the Phillips curve relationship hold for one subgroup and not for the other? Different subgroups that can be considered are
+
+* Education: high-skill vs low-skill
+* Gender: male vs female
+* Race: White vs Black
+* Age: Young vs Old
+
+The Current Population Survey MORG is the best dataset to split the labor market by above groups. But before that lets test this with 4 education levels. For inflation measure I will first use CPI inflation and then Greenbook forecasts.
+
+### Education Levels
+Data obtained from BLS for four categories
+
+1. Bachelor's degree or higher
+2. Some college or Associate's degree 
+3. High-school graduates, no college
+4. Less than high-school diploma 
+
+Estimate the following equation for each group
+$$ \pi_t-\mathbb{E}\pi_{t+1}=\beta_0+\beta_1u^s_t+\varepsilon_t  $$
+where $s$ denotes one of the four subgroups above. 
+
+#### Using Greenbook inflation forecast
+```{r}
+educat <- c("Bachelors", "Somecoll", "Highschool", "Lesshs")
+edutime <- c("1992-1997", "1998-2005", "2006-2013")
+
+# Function to combine BLS and Greenbook data
+get_bls_gb <- function(timelims){
+  start <- substr(timelims,1,4)
+  end <- substr(timelims,6,9)
+  # BLS data
+  tsunemp <- read.csv("data/BLSunemployment.csv", header = T, stringsAsFactors = F) %>% 
+    mutate(Month = as.numeric(substr(Period,2,3))) %>% 
+    filter(Year %in% c(start:end)) %>% 
+    select(-Period)
+    
+  # greenbook datat
+  gbdata_unemp <- read.csv("data/GBdata.csv", header = T, stringsAsFactors = F) %>% 
+  mutate(date = lubridate::ymd(GBdate),
+         year = year(date), 
+         month = month(date),
+         dPCPIX = gPCPIXF0 - gPCPIXB1) %>% 
+    filter(year %in% c(start:end)) %>% 
+    select(dPCPIX, year, month) %>% 
+    left_join(tsunemp, by = c("month"="Month", "year"="Year"))
+  
+  return(gbdata_unemp)
+}
+
+edugrid <- expand.grid(period=edutime,edu=educat)
+result_gb <- list()
+for (i in 1:nrow(edugrid)) {
+  fit <- run_reg("dPCPIX", edugrid$edu[i], get_bls_gb(edugrid$period[i]))
+  result_gb[[i]] <- fit
+  # names(result[[i]]) <- paste0(edugrid$edu[i],"-",edugrid$period[i])
+}
+
+stargazer(result_gb, type = "text", keep.stat = "n")
+
+```
+
+#### Using FOMC member forecasts
+```{r}
+# Function to combine BLS and FOMC member forecasts
+get_bls_fomc <- function(timelims){
+  start <- substr(timelims,1,4)
+  end <- substr(timelims,6,9)
+  # BLS data
+  tsunemp <- read.csv("data/BLSunemployment.csv", header = T, stringsAsFactors = F) %>% 
+    mutate(Month = as.numeric(substr(Period,2,3))) %>% 
+    filter(Year %in% c(start:end)) %>% 
+    select(-Period)
+    
+  # FOMC member forecasts
+  fomcdata_unemp <- read.csv("data/fomcforecasts.csv", header = T, stringsAsFactors = F) %>% 
+  mutate(date = lubridate::ymd(MPRdate),
+         year = year(date), 
+         month = month(date),
+         dINFL = INFLNY - INFLCY) %>% 
+    filter(year %in% c(start:end)) %>% 
+    select(dINFL, year, month) %>% 
+    left_join(tsunemp, by = c("month"="Month", "year"="Year"))
+  
+  return(fomcdata_unemp)
+}
+
+edugrid_fomc <- expand.grid(period = fomcdatalims, edu = educat, nairu = NA)
+result_fomc <- list()
+for (i in 1:nrow(edugrid_fomc)) {
+  fit <- run_reg("dINFL", edugrid_fomc$edu[i], get_bls_fomc(edugrid_fomc$period[i]))
+  result_fomc[[i]] <- fit
+  # names(result[[i]]) <- paste0(edugrid$edu[i],"-",edugrid$period[i])
+  edugrid_fomc$nairu[i] <- -result_fomc[[i]]$coefficients[1]/result_fomc[[i]]$coefficients[2]
+}
+
+stargazer(result_fomc, type = "text", keep.stat = "n")
+```
+
+### Gender {.tabset}
+Data obtained from FRED. 2 categories
+
+1. Male
+2. Female
+
+Estimate same equation as education levels. Here $s$ either male or female. 
+
+```{r}
+gender <- c("Men", "Women")
+# Function to combine gender data and FOMC member forecasts
+get_gender_fomc <- function(timelims){
+  start <- substr(timelims,1,4)
+  end <- substr(timelims,6,9)
+  # BLS data
+  tsunemp <- read.csv("data/gender.csv", header = T, stringsAsFactors = F) %>% 
+    mutate(date = as.Date.character(Date, tryFormats = "%Y-%m-%d"),
+           year = year(date), 
+           month = month(date)) %>% 
+    filter(year %in% c(start:end))
+    
+  # FOMC member forecasts
+  fomcdata_unemp <- read.csv("data/fomcforecasts.csv", header = T, stringsAsFactors = F) %>% 
+  mutate(date = lubridate::ymd(MPRdate),
+         year = year(date), 
+         month = month(date),
+         dINFL = INFLNY - INFLCY) %>% 
+    filter(year %in% c(start:end)) %>% 
+    select(dINFL, year, month) %>% 
+    left_join(tsunemp, by = c("month"="month", "year"="year")) %>% 
+    select(-Date, -date)
+  
+  return(fomcdata_unemp)
+}
+
+gengrid_fomc <- expand.grid(period = fomcdatalims, gender = gender, nairu = NA)
+gender_fomc <- list()
+for (i in 1:nrow(gengrid_fomc)) {
+  fit <- run_reg("dINFL", gengrid_fomc$gender[i], get_gender_fomc(gengrid_fomc$period[i]))
+  gender_fomc[[i]] <- fit
+  # names(result[[i]]) <- paste0(edugrid$edu[i],"-",edugrid$period[i])
+  gengrid_fomc$nairu[i] <- -gender_fomc[[i]]$coefficients[1]/gender_fomc[[i]]$coefficients[2]
+}
+
+```
+
+#### Regression results
+```{r}
+stargazer(gender_fomc, type = "text", keep.stat = c("n", "rsq"))
+```
+
+Sample periods for (1)-(3) and (4)-(6) same as FOMC member forecast regressions.
+
+For `r fomcdatalims[1]` sample, slope coefficient is highly significant for Men and Women. Both coefficients are negative and shows Women have a larger slope than Men, meaning their PC is steeper. For `r fomcdatalims[2]` sample, Women have a significant and positive slope.
+
+#### Nairu estimates
+```{r}
+gengrid_fomc
+```
+
+### Race {.tabset}
+Data obtained from FRED. 3 categories
+
+1. White
+2. Black or African-American
+3. Hispanic or Latino
+
+Estimate same equation as education levels. Here $s$ White, Black or Hispanic 
+
+```{r}
+race <- c("White", "Black", "Hispanic")
+# Function to combine race data and FOMC member forecasts
+get_race_fomc <- function(timelims){
+  start <- substr(timelims,1,4)
+  end <- substr(timelims,6,9)
+  # Fred data
+  tsunemp <- read.csv("data/race.csv", header = T, stringsAsFactors = F) %>% 
+    mutate(date = as.Date.character(DATE, tryFormats = "%Y-%m-%d"),
+           year = year(date), 
+           month = month(date)) %>% 
+    filter(year %in% c(start:end))
+    
+  # FOMC member forecasts
+  fomcdata_unemp <- read.csv("data/fomcforecasts.csv", header = T, stringsAsFactors = F) %>% 
+  mutate(date = lubridate::ymd(MPRdate),
+         year = year(date), 
+         month = month(date),
+         dINFL = INFLNY - INFLCY) %>% 
+    filter(year %in% c(start:end)) %>% 
+    select(dINFL, year, month) %>% 
+    left_join(tsunemp, by = c("month"="month", "year"="year")) %>% 
+    select(-DATE, -date)
+  
+  return(fomcdata_unemp)
+}
+
+racegrid_fomc <- expand.grid(period = fomcdatalims, race = race, nairu = NA)
+race_fomc <- list()
+for (i in 1:nrow(racegrid_fomc)) {
+  fit <- run_reg("dINFL", racegrid_fomc$race[i], get_race_fomc(racegrid_fomc$period[i]))
+  race_fomc[[i]] <- fit
+  # names(result[[i]]) <- paste0(edugrid$edu[i],"-",edugrid$period[i])
+  racegrid_fomc$nairu[i] <- -race_fomc[[i]]$coefficients[1]/race_fomc[[i]]$coefficients[2]
+}
+
+```
+
+#### Regression result
+```{r}
+stargazer(race_fomc, type = "text", keep.stat = c("n", "rsq"))
+```
+
+For `r fomcdatalims[1]` sample, all three races have highly significant slope coefficient. Slope is negative. Slope is steeper for White, then Hispanic and lastly Black. For `r fomcdatalims[2]` sample, White and Hispanic have a positive and significant coefficient. For `r fomcdatalims[3]` sample, only Hispanic population have a significant coefficient.
+
+#### Nairu estimate
+```{r}
+racegrid_fomc
+```
+
+

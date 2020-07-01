@@ -1,0 +1,597 @@
+---
+title: "Is the Phillips Curve dead for all?"
+author: "Pritha Chaudhuri"
+date: "6/2/2020"
+output: 
+  html_document:
+    code_folding: hide
+---
+
+<style> p.caption {font-weight: bold;} </style>
+
+<div style="margin-bottom:100px;">
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = FALSE)
+```
+
+```{r}
+library(pacman) # package to install and load packages with one command
+p_load(tidyverse,lubridate,xml2,rvest,ggplot2,doParallel,stargazer,forecast)
+set.seed(123)
+source("theme_pri.R")
+
+## Header for tabset
+catHeader <- function(text = "", level = 3) {
+  cat(paste0("\n\n",paste(rep("#", level),collapse="")," ",text,"\n"))
+}
+
+## Function to draw scatterplot
+scatterplot <- function(data,x,y){
+  qplot(x, y, data = as.data.frame(data), color = I("blue"), shape = I(15)) + 
+  xlab("Unemployment Rate") + 
+  ylab("Inflation") + 
+  theme_minimal()
+}
+
+## Run ts regression
+run_tslm <- function(y,x,data){
+  form <- as.formula(paste0(paste(y),"~",paste(x, collapse = "+")))
+  fit <- tslm(form,data = data)
+  return(fit)
+}
+
+## Function to calculate RMSE
+calc_rmse <- function(actual,pred){
+  rmse <- sqrt(mean(actual-pred)^2)
+  return(rmse)
+}
+```
+
+## Aggregate Phillips Curve: Data
+Available measures of inflation and inflation expectations
+
+ * Consumer Price Index (CPI), BLS measure
+ * Personal Consumption Expenditure (PCE), BEA measure
+ * GDP Deflator
+ * Greenbook forecasts
+ * FOMC Member forecasts
+ * Michigan Survey of Consumers, household expectations of inflation
+
+Measure of unemployment
+
+ * BLS measure
+ * Greenbook forecast
+ * FOMC member forecasts
+ 
+### CPI, PCE and BLS measure of unemployment
+Monthly inflation is calculated as
+$$\pi_t=1200\times(\log(P_t)-log(P_{t-1})) $$
+where $P_t$ is a price index (CPI or PCE) in month $t$. Quarterly averages of monthly inflation and unemployment are then calculated. 
+
+```{r}
+# Function to get data and calculate inflation
+get_data <- function(macrovars, start, end){
+  tsmacro <- list()
+  for (i in macrovars){
+    tsmacro[[i]] <- read.csv(paste0("data/",i,".csv"), header = T, stringsAsFactors = F) %>%
+      mutate(Date = as.Date.character(DATE, tryFormats = "%Y-%m-%d"),
+             year = year(Date),
+             month = month(Date),
+             quarter = quarter(Date)) %>%
+      filter(year %in% c(start:end)) %>% 
+      select(Date, year, month, quarter, i)
+  }
+  
+  # aggmacro <- bind_cols(tsmacro) %>% 
+  #   select(Date, year, month, macrovars)
+  
+  aggmacro <- reduce(tsmacro, left_join, by = c("Date", "year", "month", "quarter")) %>%
+    arrange(Date) %>%
+    mutate(piCPI = 1200*(log(CPIAUCSL)-lag(log(CPIAUCSL))),
+           # EpiCPI =(lag(piCPI,1)+lag(piCPI,2)+lag(piCPI,3)+lag(piCPI,4))/4,
+           piPCEPI = 1200*(log(PCEPI)-lag(log(PCEPI))),
+           # EpiPCEPI = (lag(piPCEPI,1)+lag(piPCEPI,2)+lag(piPCEPI,3)+lag(piPCEPI,4))/4,
+           ) %>%
+    group_by(year, quarter) %>% 
+    summarise(qpiCPI = mean(piCPI, na.rm = T),
+              # qEpiCPI = mean(EpiCPI, na.rm = T), 
+              qpiPCEPI = mean(piPCEPI, na.rm = T),
+              # qEpiPCEPI = mean(EpiPCEPI, na.rm = T),
+              qUNRATE = mean(UNRATE, na.rm = T)) %>% 
+    ungroup() %>% 
+    mutate(qEpiCPI = lag(qpiCPI),
+           qEpiPCEPI = lag(qpiPCEPI)) %>% 
+      filter(year %in% c(start+1:end))
+  
+  return(aggmacro)
+}
+
+# Save data as time series
+aggdata <- ts(get_data(c("UNRATE", "CPIAUCSL", "PCEPI"), 1989, 2019), start = 1990, frequency = 4)
+
+# Plot of quarterly CPI inflation
+autoplot(aggdata[,"qpiCPI"]) + 
+  ggtitle("Quarterly CPI Inflation") +
+  xlab("Quarters") + 
+  ylab("% change") + 
+  theme_pri()
+
+# Scatter plot of inflation and Unemployment
+qplot(qUNRATE, qpiCPI, data = as.data.frame(aggdata), color = I("blue"), shape = I("circle")) + 
+  xlab("Unemployment Rate") + 
+  ylab("CPI Inflation") + 
+  theme_pri()
+```
+
+### Greenbook Forecasts
+Greenbook projections are made available to the FOMC before each meeting. The Fed research staff makes projections of how the economy will fare in the future. The data is made available to the public with a 5 year lag. Most current year of data is 2013. 
+
+Each year there are approximately 8 FOMC meetings and hence 8 sets of Greenbook forecasts that are released each year. So for each quarter there are 2 forecasts available and I use the mean of the 2 forecasts.
+
+Specifically, the variables of interest from each Greenbook are
+
+* gPCPIXF0: inflation forecast for current quarter
+* gPCPIXB1: historical value of inflation for previous quarter
+* UNEMPF0: unemployment forecast for current quarter
+
+The inflation measure for current quarter $t$ is the mean of PCPIXF0 for the two forecasts released that quarter. For example, 1990:Q1 had FOMC meetings in February and March. Then the inflation measure for 1990:Q1 is 
+
+$$\pi_{1990:Q1} = \frac{1}{2}\Big( gPCPIXF0_{1990:Feb}+gPCPIXF0_{1990:March} \Big) $$
+Simialrly, for expected inflation and unemployment rate. 
+
+```{r}
+# Function to get Greenbook data
+get_gbdata <- function(timelims){
+  start <- substr(timelims,1,4)
+  end <- substr(timelims,6,9)
+  gbdata <- read.csv("data/GBdata.csv", header = T, stringsAsFactors = F) %>% 
+  mutate(date = lubridate::ymd(GBdate),
+         year = year(date), 
+         month = month(date),
+         quarter = quarter(date)) %>% 
+    group_by(year, quarter) %>% 
+    summarise(qPCPIXF0 = mean(gPCPIXF0),
+              qPCPIXB1 = mean(gPCPIXB1),
+              qUNEMP = mean(UNEMPF0)) %>% 
+  filter(year %in% c(start:end)) 
+  
+  return(gbdata)
+}
+
+gbdata <- get_gbdata("1990-2013")
+tsgbdata <- ts(gbdata, start = 1990, frequency = 4)
+
+# Scatterplot of inflation (NOT difference!!) and unemployment rate
+tsgbdata %>% 
+  as.data.frame() %>% 
+  ggplot(aes(qUNEMP, qPCPIXF0)) +
+  geom_point(shape = 15, color = "black") + 
+  geom_smooth(method = "lm", se = F, linetype = "solid", color = "blue") + 
+  xlab("Unemployment rate") + 
+  ylab("Inflation") +
+  theme_pri()
+```
+
+
+## Aggregate Phillips Curve: Estimation
+Estimate the following Phillips Curve
+$$ \pi_t=\alpha+\beta\pi_{t-1}+\gamma u_t+\varepsilon_t $$
+where $\pi_t$ is inflation in current quarter $t$ and $\pi_{t-1}$ is inflation in previous quarter. 
+
+### Greenbook Forecasts {.tabset}
+#### Estimation results
+Estimate PC for 1990-2013. Results of estimation and plot of fitted values. 
+```{r}
+fit_gb <- tslm(qPCPIXF0 ~ qPCPIXB1 + qUNEMP, 
+               data = tsgbdata)
+
+summary(fit_gb)
+```
+#### Actual vs Fitted values 
+```{r}
+# Plot of actual vs fitted values
+autoplot(tsgbdata[,"qPCPIXF0"], series = "Data") + 
+  autolayer(fitted(fit_gb), series = "Fitted") +
+  xlab("Year") + ylab("") + 
+  ggtitle("Quarterly Inflation: Actual vs Fitted") + 
+  guides(color = guide_legend(title = " ")) + 
+  theme_pri()
+```
+
+#### Forecast
+Forecasting 2014-2019 (24 quarters) inflation using above model. Compare with actual inflation for 2014-2019 and calculate RMSE. 
+```{r}
+data_2014_2019 <- as.data.frame(aggdata) %>% 
+  filter(year %in% c(2014:2019)) %>% 
+  select(qpiCPI, qPCPIXB1=qEpiCPI, qUNEMP=qUNRATE)
+
+forecast_gb <- forecast(fit_gb, newdata = data_2014_2019[,c("qPCPIXB1", "qUNEMP")])
+
+# Data vs Forecast plot
+autoplot(tsgbdata[, "qPCPIXF0"], series = "Data Insample") + 
+  autolayer(fitted(fit_gb), series = "Fitted values") + 
+  autolayer(forecast_gb, PI = F, series = "Forecast values") +
+  autolayer(ts(data_2014_2019[, "qpiCPI"], start = 2014, frequency = 4), series = "Data out-of-sample") + 
+  ylab("Inflation") +
+  guides(color = guide_legend(title = "Series")) + 
+  theme_pri()
+```
+
+#### RMSE of forecast
+```{r}
+calc_rmse(as.matrix(data_2014_2019$qpiCPI), as.matrix(as.numeric(forecast_gb$mean)))
+```
+
+## Disaggregate Phillips Curve: Data
+Above exercise so far has been considering the entire economy and the aggregate unemployment rate. But what about different subgroups of the labor market? Will the Phillips curve relationship hold for one subgroup and not for the other? Different subgroups that can be considered are
+
+* Education: high-skill vs low-skill
+* Gender: male vs female
+* Race: White vs Black
+* Age: Young vs Old
+
+We can estimate Phillips curves for the different sugroups and combine them to get the aggregate Phillips curve for the economy. This accounts for any variation there might be in the inflation-unemployment relationship by subgroups. 
+
+To calculate unemployment numbers I use the CPS MORG files from 1979-2018.
+
+### Education Levels {.tabset}
+The four different categories considered are
+
+1. Bachelor's degree or higher
+2. Some college or Associate's degree 
+3. High-school graduates, no college
+4. Less than high-school diploma 
+
+Using these 4 categories of education and combining them with Greenbook forecasts for inflation. The CPS data is available starting at 1979. Even though Greenbooks have been published since 1967, the full range of inflation forecasts arent available until 1986, which is where I start. Greenbook forecasts end in 2013.
+
+```{r, results="asis", echo=F}
+# Read cps education data
+cpseducation <- read.csv("cspedu_quarterly_1979_2018.csv")
+
+# Function to combine BLS and Greenbook data
+get_edu_gb <- function(timelims){
+  start <- substr(timelims,1,4)
+  end <- substr(timelims,6,9)
+  
+  gbdata_unemp <- read.csv("data/GBdata.csv", header = T, stringsAsFactors = F) %>% 
+  mutate(date = lubridate::ymd(GBdate),
+         year = year(date), 
+         month = month(date),
+         quarter = quarter(date)) %>% 
+    filter(year %in% c(start:end)) %>% 
+    group_by(year, quarter) %>% 
+    summarise(qPCPIXF0 = mean(gPCPIXF0),
+              qPCPIXB1 = mean(gPCPIXB1)) %>% 
+    left_join(cpseducation, by = c("year", "quarter"))
+  
+  return(gbdata_unemp)
+}
+
+gbdata_unemp <- get_edu_gb("1986-2013")
+tsgbdata_unemp <- ts(gbdata_unemp, start = 1986, frequency = 4)
+unempcat <- c("qBachelors", "qSomecoll", "qHSgrad", "qLessHS")
+
+plot_uscatter <- function(data){
+  plots <- lapply(unempcat, function(x) data %>% 
+                          as.data.frame() %>% 
+                          ggplot(aes_string(x, "qPCPIXF0")) +
+                          geom_point(shape = "circle", color = "black") + 
+                          geom_smooth(method = "lm", se = F, linetype = "solid", color = "blue") + 
+                          xlab(paste0(x, " Unemployment rate")) + 
+                          ylab("Inflation") +
+                          theme_pri() )
+  
+  return(plots)
+}
+
+# plot_uscatter <- lapply(unempcat, function(x) tsgbdata_unemp %>% 
+#                           as.data.frame() %>% 
+#                           ggplot(aes_string(x, "qPCPIXF0")) +
+#                           geom_point(shape = 15, color = "black") + 
+#                           geom_smooth(method = "lm", se = F, linetype = "solid", color = "blue") + 
+#                           xlab(paste0(x, " Unemployment rate")) + 
+#                           ylab("Inflation") +
+#                           theme_minimal() )
+
+for (i in 1:length(unempcat)) {
+  catHeader(unempcat[[i]], level = 4)
+  print(plot_uscatter(tsgbdata_unemp)[[i]])
+}
+
+```
+
+
+### Gender {.tabset}
+Unemployment data by gender obtained from FRED database. The 2 categories are Men and Women. This data is combined with the Greenbook forecasts for inflation. Overall sample is 1992-2013.
+```{r, results="asis", echo=F}
+# Function to combine FRED gender data and Greenbook data
+get_gender_gb <- function(timelims){
+  start <- substr(timelims,1,4)
+  end <- substr(timelims,6,9)
+  # greenbook data
+  gbdata_unemp <- read.csv("data/GBdata.csv", header = T, stringsAsFactors = F) %>%
+  mutate(date = lubridate::ymd(GBdate),
+         year = year(date),
+         month = month(date),
+         quarter = quarter(date)) %>%
+    filter(year %in% c(start:end)) %>%
+    group_by(year, quarter) %>%
+    summarise(qPCPIXF0 = mean(gPCPIXF0),
+              qPCPIXB1 = mean(gPCPIXB1)) %>% 
+    left_join(cpsgender, by = c("year", "quarter"))
+
+  return(gbdata_unemp)
+}
+
+gbdata_gender <- get_gender_gb("1986-2013")
+tsgbdata_gender <- ts(gbdata_gender, start = 1986, frequency = 4)
+unempcat <- c("qMen", "qWomen")
+
+for (i in 1:length(unempcat)) {
+  catHeader(unempcat[[i]], level = 4)
+  print(plot_uscatter(tsgbdata_gender)[[i]])
+}
+```
+
+<!-- ### Race -->
+<!-- Unemployment data by race obtained from FRED database. The 3 categories are White, Black/African-American and Hispanic/Latino This data is combined with the Greenbook forecasts for inflation. Overall sample is 1992-2013. -->
+<!-- ```{r, results="asis", echo=F} -->
+<!-- # Function to combine FRED race data and Greenbook data -->
+<!-- get_race_gb <- function(timelims){ -->
+<!--   start <- substr(timelims,1,4) -->
+<!--   end <- substr(timelims,6,9) -->
+<!--   # Race data -->
+<!--   tsunemp <- read.csv("data/race.csv", header = T, stringsAsFactors = F) %>%  -->
+<!--     mutate(date = as.Date.character(DATE, tryFormats = "%Y-%m-%d"), -->
+<!--            year = year(date),  -->
+<!--            month = month(date)) %>%  -->
+<!--     filter(year %in% c(start:end)) -->
+
+<!--   # greenbook data -->
+<!--   gbdata_unemp <- read.csv("data/GBdata.csv", header = T, stringsAsFactors = F) %>%  -->
+<!--   mutate(date = lubridate::ymd(GBdate), -->
+<!--          year = year(date),  -->
+<!--          month = month(date), -->
+<!--          quarter = quarter(date)) %>%  -->
+<!--     filter(year %in% c(start:end)) %>%  -->
+<!--     left_join(tsunemp, by = c("month"="month", "year"="year")) %>%  -->
+<!--     group_by(year, quarter) %>%  -->
+<!--     summarise(qPCPIXF0 = mean(gPCPIXF0), -->
+<!--               qPCPIXB1 = mean(gPCPIXB1), -->
+<!--               qWhite = mean(White), -->
+<!--               qBlack = mean(Black), -->
+<!--               qHispanic = mean(Hispanic)) -->
+
+<!--   return(gbdata_unemp) -->
+<!-- } -->
+
+<!-- gbdata_race <- get_race_gb("1992-2013") -->
+<!-- tsgbdata_race <- ts(gbdata_race, start = 1992, frequency = 4) -->
+<!-- unempcat <- c("qWhite", "qBlack", "qHispanic") -->
+
+<!-- for (i in 1:length(unempcat)) { -->
+<!--   catHeader(unempcat[[i]], level = 4) -->
+<!--   print(plot_uscatter(tsgbdata_race)[[i]]) -->
+<!-- } -->
+<!-- ``` -->
+
+
+## Disaggregate Phillips Curve: Estimation
+Estimate the following Phillips Curve
+
+$$\pi_t=\alpha+\beta\pi_{t-1}+\gamma u^s_t+\varepsilon_t  $$
+
+where $\pi_t$ is inflation in current quarter $t$ and $\pi_{t-1}$ is inflation in previous quarter. $u^s_t$ is the unemployment rate of the subgroup $s$.
+
+### Education {.tabset}
+```{r, echo=F}
+unempcat <- c("qBachelors", "qSomecoll", "qHSgrad", "qLessHS")
+
+fit_gb_edu <- lapply(unempcat, function(x) run_tslm("qPCPIXF0",c("qPCPIXB1", x), tsgbdata_unemp) )
+
+# for (i in 1:length(unempcat)) {
+#   catHeader(unempcat[[i]], level = 4)
+#   print(summary(fit_gb_edu[[i]]))
+# }
+```
+
+#### Bachelors
+**Parameter Estimates**
+```{r, echo=F}
+# Summary of fit
+summary(fit_gb_edu[[1]])
+```
+Coefficient estimate on unemployment shows PC is negative with slope of 0.27, significant at the 0.1% level. 
+
+**Actual vs Fitted Values**
+```{r}
+autoplot(tsgbdata_unemp[,"qPCPIXF0"], series = "Data") +
+  autolayer(fitted(fit_gb_edu[[1]]), series = "Fitted ") +
+  xlab("Year") + ylab("") + 
+  ggtitle("Quarterly Inflation: Bachelors") + 
+  guides(color = guide_legend(title = "Series")) + 
+  theme_pri()
+```
+
+**Inflation Forecast**
+
+Forecasting 2014-2018 (20 quarters) inflation using above model. Compare with actual inflation for 2014-2018 and calculate RMSE. 
+```{r}
+# Combine CPS education data with BLS CPI data for 2014-2019
+edu_2014_2019 <- data.frame(aggdata) %>% 
+  filter(year %in% c(2014:2018)) %>% 
+  left_join(cpseducation, by = c("year", "quarter")) %>% 
+  rename("qPCPIXF0"="qpiCPI", "qPCPIXB1"="qEpiCPI")
+
+forecast_gb_bach <- forecast(fit_gb_edu[[1]], newdata = edu_2014_2019[,c("qPCPIXB1", "qBachelors")])
+
+# Data vs Forecast plot
+autoplot(tsgbdata_unemp[, "qPCPIXF0"], series = "Data Insample") + 
+  autolayer(fitted(fit_gb_edu[[1]]), series = "Fitted values") + 
+  autolayer(forecast_gb_bach, PI = F, series = "Forecast values") +
+  autolayer(ts(edu_2014_2019[, "qPCPIXF0"], start = 2014, frequency = 4), series = "Data out-of-sample") + 
+  xlab("Year") + ylab("") + 
+  ggtitle("Quarterly Inflation: Bachelors") +
+  guides(color = guide_legend(title = "Series")) + 
+  theme_pri()
+```
+
+**Root mean squared error** for the forecast is
+```{r}
+calc_rmse(as.matrix(edu_2014_2019$qPCPIXF0), as.matrix(as.numeric(forecast_gb_bach$mean)))
+```
+
+#### Some College
+**Parameter Estimates**
+```{r, echo=F}
+summary(fit_gb_edu[[2]])
+```
+Slope of Phillips Curve is -0.097, flatter than the Bachelor's group, and significant at the 5% level. 
+
+**Actual vs Fitted Values and Forecast**
+```{r}
+forecast_gb_scoll <- forecast(fit_gb_edu[[2]], newdata = edu_2014_2019[,c("qPCPIXB1", "qSomecoll")])
+
+# Data vs Forecast plot
+autoplot(tsgbdata_unemp[, "qPCPIXF0"], series = "Data Insample") + 
+  autolayer(fitted(fit_gb_edu[[2]]), series = "Fitted values") + 
+  autolayer(forecast_gb_scoll, PI = F, series = "Forecast values") +
+  autolayer(ts(edu_2014_2019[, "qPCPIXF0"], start = 2014, frequency = 4), series = "Data out-of-sample") + 
+  xlab("Year") + ylab("") +
+  ggtitle("Quarterly Inflation: Some College") + 
+  guides(color = guide_legend(title = "Series")) + 
+  theme_pri()
+```
+
+**Root mean squared error** for the forecast is
+```{r}
+calc_rmse(as.matrix(edu_2014_2019$qPCPIXF0), as.matrix(as.numeric(forecast_gb_scoll$mean)))
+```
+
+#### High school graduate, no college
+```{r, echo=F}
+summary(fit_gb_edu[[3]])
+```
+Even though the slope is negative, the parameter estimate is insignificant. This implies unemployment levels of high-school graduates do not respond to inflation. 
+
+**Actual vs Fitted values and Forecast**
+```{r}
+forecast_gb_hs <- forecast(fit_gb_edu[[3]], newdata = edu_2014_2019[,c("qPCPIXB1", "qHSgrad")])
+
+# Data vs Forecast plot
+autoplot(tsgbdata_unemp[, "qPCPIXF0"], series = "Data Insample") + 
+  autolayer(fitted(fit_gb_edu[[3]]), series = "Fitted values") + 
+  autolayer(forecast_gb_hs, PI = F, series = "Forecast values") +
+  autolayer(ts(edu_2014_2019[, "qPCPIXF0"], start = 2014, frequency = 4), series = "Data out-of-sample") + 
+  xlab("Year") + ylab("") +
+  ggtitle("Quarterly Inflation: High-school graduate") + 
+  guides(color = guide_legend(title = "Series")) + 
+  theme_pri()
+```
+
+**Root mean squared error** for the forecast is
+```{r}
+calc_rmse(as.matrix(edu_2014_2019$qPCPIXF0), as.matrix(as.numeric(forecast_gb_hs$mean)))
+```
+
+#### Less than HS
+**Parameter Estimates**
+```{r, echo=F}
+summary(fit_gb_edu[[4]])
+```
+Once again the slope is negative but the parameter estimate is insignificant. Unemployment levels for people with less than high-school degree also do not respond to inflation. 
+
+**Actual vs Fitted values and Forecast**
+```{r}
+forecast_gb_lesshs <- forecast(fit_gb_edu[[4]], newdata = edu_2014_2019[,c("qPCPIXB1", "qLessHS")])
+
+# Data vs Forecast plot
+autoplot(tsgbdata_unemp[, "qPCPIXF0"], series = "Data Insample") + 
+  autolayer(fitted(fit_gb_edu[[4]]), series = "Fitted values") + 
+  autolayer(forecast_gb_lesshs, PI = F, series = "Forecast values") +
+  autolayer(ts(edu_2014_2019[, "qPCPIXF0"], start = 2014, frequency = 4), series = "Data out-of-sample") + 
+  xlab("Year") + ylab("") +
+  ggtitle("Quarterly Inflation: Less than High-school") + 
+  guides(color = guide_legend(title = "Series")) + 
+  theme_pri()
+```
+
+**Root mean squared error** for the forecast is
+```{r}
+calc_rmse(as.matrix(edu_2014_2019$qPCPIXF0), as.matrix(as.numeric(forecast_gb_lesshs$mean)))
+```
+
+
+### Gender {.tabset}
+```{r}
+unempcat <- c("qMen", "qWomen")
+fit_gb_gender <- lapply(unempcat, function(x) run_tslm("qPCPIXF0", c("qPCPIXB1", x), tsgbdata_gender) )
+
+# for (i in 1:length(unempcat)) {
+#   catHeader(unempcat[[i]], level = 5)
+#   summary(fit_gb_gender[[i]])
+# }
+```
+
+#### Men
+**Parameter Estimates**
+```{r}
+summary(fit_gb_gender[[1]])
+```
+
+The coefficient on men unemployment, though being negative, is insignificant. This suggests unemployment for men do not respond to inflation and the Phillips curve is not a good indicator of labor market tightness in the men labor market. 
+
+**Actual vs Fitted values and Forecast**
+```{r}
+# Combine CPS gender data with BLS CPI data for 2014-2018
+gender_2014_2019 <- data.frame(aggdata) %>% 
+  filter(year %in% c(2014:2018)) %>% 
+  left_join(cpsgender, by = c("year", "quarter")) %>% 
+  rename("qPCPIXF0"="qpiCPI", "qPCPIXB1"="qEpiCPI")
+
+forecast_gb_men <- forecast(fit_gb_gender[[1]], newdata = gender_2014_2019[,c("qPCPIXB1","qMen")])
+
+# Data vs forecast plot
+autoplot(tsgbdata_gender[, "qPCPIXF0"], series = "Data insample") + 
+  autolayer(fitted(fit_gb_gender[[1]]), series = "Fitted values") + 
+  autolayer(forecast_gb_men$mean, series = "Forecast values") +
+  autolayer(ts(gender_2014_2019[, "qPCPIXF0"], start = 2014, frequency = 4), series = "Data out-of-sample") + 
+  xlab("Year") + ylab("") +
+  ggtitle("Quarterly Inflation: Men ") +
+  guides(color = guide_legend(title = "Series")) + 
+  theme_pri()
+```
+
+**Root mean squared error** of forecast is 
+```{r}
+calc_rmse(as.matrix(gender_2014_2019$qPCPIXF0), as.matrix(as.numeric(forecast_gb_men$mean)))
+```
+
+#### Women
+**Parameter Estimate**
+```{r}
+summary(fit_gb_gender[[2]])
+```
+
+Similarly, for women the slope of the Phillips curve is insignificant.
+
+**Actual vs Fitted values and Forecast**
+```{r}
+forecast_gb_women <- forecast(fit_gb_gender[[2]], newdata = gender_2014_2019[,c("qPCPIXB1","qWomen")])
+
+# Data vs forecast plot
+autoplot(tsgbdata_gender[, "qPCPIXF0"], series = "Data insample") + 
+  autolayer(fitted(fit_gb_gender[[2]]), series = "Fitted values") + 
+  autolayer(forecast_gb_women$mean, series = "Forecast values") +
+  autolayer(ts(gender_2014_2019[, "qPCPIXF0"], start = 2014, frequency = 4), series = "Data out-of-sample") + 
+  xlab("Year") + ylab("") +
+  ggtitle("Quarterly Inflation: Women ") +
+  guides(color = guide_legend(title = "Series")) + 
+  theme_pri()
+```
+
+**Root mean squared error** of forecast is 
+```{r}
+calc_rmse(as.matrix(gender_2014_2019$qPCPIXF0), as.matrix(as.numeric(forecast_gb_women$mean)))
+```
