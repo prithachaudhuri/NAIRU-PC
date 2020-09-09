@@ -12,3 +12,5 @@ The above exercise shows insignificance of the Phillips Curve relationship over 
 
 nairu_1.Rmd file describes the analysis. The corresponding html file is https://htmlpreview.github.io/?https://github.com/pritha10/NAIRU-PC/blob/master/nairu_1.html.
 
+nairu_2.Rmd describes a closer inspection of the disaggregated Phillips Curve for the education and gender groups. The corresponding html file is https://htmlpreview.github.io/?https://github.com/pritha10/NAIRU-PC/blob/master/nairu_2.html. 
+
