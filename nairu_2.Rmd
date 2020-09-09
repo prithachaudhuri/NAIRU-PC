@@ -305,6 +305,9 @@ for (i in 1:length(unempcat)) {
 ### Gender {.tabset}
 Unemployment data by gender obtained from FRED database. The 2 categories are Men and Women. This data is combined with the Greenbook forecasts for inflation. Overall sample is 1992-2013.
 ```{r, results="asis", echo=F}
+# Read cps education data
+cpsgender <- read.csv("cpsgender_quarterly_1979_2018.csv")
+
 # Function to combine FRED gender data and Greenbook data
 get_gender_gb <- function(timelims){
   start <- substr(timelims,1,4)
@@ -405,6 +408,7 @@ summary(fit_gb_edu[[1]])
 Coefficient estimate on unemployment shows PC is negative with slope of 0.27, significant at the 0.1% level. 
 
 **Actual vs Fitted Values**
+
 ```{r}
 autoplot(tsgbdata_unemp[,"qPCPIXF0"], series = "Data") +
   autolayer(fitted(fit_gb_edu[[1]]), series = "Fitted ") +
@@ -417,6 +421,7 @@ autoplot(tsgbdata_unemp[,"qPCPIXF0"], series = "Data") +
 **Inflation Forecast**
 
 Forecasting 2014-2018 (20 quarters) inflation using above model. Compare with actual inflation for 2014-2018 and calculate RMSE. 
+
 ```{r}
 # Combine CPS education data with BLS CPI data for 2014-2019
 edu_2014_2019 <- data.frame(aggdata) %>% 
@@ -438,6 +443,7 @@ autoplot(tsgbdata_unemp[, "qPCPIXF0"], series = "Data Insample") +
 ```
 
 **Root mean squared error** for the forecast is
+
 ```{r}
 calc_rmse(as.matrix(edu_2014_2019$qPCPIXF0), as.matrix(as.numeric(forecast_gb_bach$mean)))
 ```
